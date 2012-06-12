@@ -1585,13 +1585,18 @@ static void *todo_work(void *arg)
 	return NULL;
 }
 
-static int unlink_outputs(int dfd, struct node *n)
+static int unlink_outputs(struct node *n)
 {
 	struct edge *e;
 	struct node *output;
 	LIST_FOREACH(e, &n->edges, list) {
+		int dfd, rc;
 		output = e->dest;
-		if(unlinkat(dfd, output->tent->name.s, 0) < 0) {
+		dfd = tup_entry_open(output->tent->parent);
+		rc = unlinkat(dfd, output->tent->name.s, 0);
+		close(dfd);
+
+		if(rc < 0) {
 			if(errno != ENOENT) {
 				pthread_mutex_lock(&display_mutex);
 				show_result(n->tent, 1, NULL, NULL);
@@ -1740,7 +1745,7 @@ static int update(struct node *n)
 		goto err_out;
 	}
 
-	if(unlink_outputs(dfd, n) < 0)
+	if(unlink_outputs(n) < 0)
 		goto err_close_dfd;
 
 	pthread_mutex_lock(&db_mutex);

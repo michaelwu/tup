@@ -198,7 +198,7 @@ static int check_recursive_chain(struct tupfile *tf, const char *input_pattern,
 				 struct rule *r, const char *ext);
 static int input_pattern_to_nl(struct tupfile *tf, char *p,
 			       struct name_list *nl, struct bin_head *bl,
-			       int required);
+			       int required, int keep_glob);
 static int get_path_list(struct tupfile *tf, char *p, struct path_list_head *plist,
 			 tupid_t dt, struct bin_head *bl);
 static void make_path_list_unique(struct path_list_head *plist);
@@ -207,9 +207,9 @@ static void make_name_list_unique(struct name_list *nl);
 static int parse_dependent_tupfiles(struct path_list_head *plist,
 				    struct tupfile *tf, struct graph *g);
 static int get_name_list(struct tupfile *tf, struct path_list_head *plist,
-			 struct name_list *nl, int required);
+			 struct name_list *nl, int required, int keep_glob);
 static int nl_add_path(struct tupfile *tf, struct path_list *pl,
-		       struct name_list *nl, int required);
+		       struct name_list *nl, int required, int keep_glob);
 static int nl_add_bin(struct bin *b, struct name_list *nl);
 static int build_name_list_cb(void *arg, struct tup_entry *tent);
 static char *set_path(const char *name, const char *dir, int dirlen);
@@ -1659,11 +1659,11 @@ static int parse_input_pattern(struct tupfile *tf, char *input_pattern,
 			*oosep = 0;
 			oosep++;
 		}
-		if(input_pattern_to_nl(tf, oosep, order_only_inputs, bl, required) < 0)
+		if(input_pattern_to_nl(tf, oosep, order_only_inputs, bl, required, 1) < 0)
 			return -1;
 	}
 	if(inputs) {
-		if(input_pattern_to_nl(tf, eval_pattern, inputs, bl, required) < 0)
+		if(input_pattern_to_nl(tf, eval_pattern, inputs, bl, required, 0) < 0)
 			return -1;
 	} else {
 		if(eval_pattern[0]) {
@@ -2073,7 +2073,7 @@ static int check_recursive_chain(struct tupfile *tf, const char *input_pattern,
 
 static int input_pattern_to_nl(struct tupfile *tf, char *p,
 			       struct name_list *nl, struct bin_head *bl,
-			       int required)
+			       int required, int keep_glob)
 {
 	struct path_list_head plist;
 	struct path_list *pl, *tmp;
@@ -2083,7 +2083,7 @@ static int input_pattern_to_nl(struct tupfile *tf, char *p,
 		return -1;
 	if(parse_dependent_tupfiles(&plist, tf, tf->g) < 0)
 		return -1;
-	if(get_name_list(tf, &plist, nl, required) < 0)
+	if(get_name_list(tf, &plist, nl, required, keep_glob) < 0)
 		return -1;
 	TAILQ_FOREACH_SAFE(pl, &plist, list, tmp) {
 		del_pl(pl, &plist);
@@ -2271,7 +2271,7 @@ static int parse_dependent_tupfiles(struct path_list_head *plist,
 }
 
 static int get_name_list(struct tupfile *tf, struct path_list_head *plist,
-			 struct name_list *nl, int required)
+			 struct name_list *nl, int required, int keep_glob)
 {
 	struct path_list *pl;
 
@@ -2280,7 +2280,7 @@ static int get_name_list(struct tupfile *tf, struct path_list_head *plist,
 			if(nl_add_bin(pl->bin, nl) < 0)
 				return -1;
 		} else {
-			if(nl_add_path(tf, pl, nl, required) < 0)
+			if(nl_add_path(tf, pl, nl, required, keep_glob) < 0)
 				return -1;
 		}
 	}
@@ -2301,7 +2301,7 @@ static int char_find(const char *s, int len, const char *list)
 }
 
 static int nl_add_path(struct tupfile *tf, struct path_list *pl,
-		       struct name_list *nl, int required)
+		       struct name_list *nl, int required, int keep_glob)
 {
 	struct build_name_list_args args;
 
@@ -2385,6 +2385,17 @@ static int nl_add_path(struct tupfile *tf, struct path_list *pl,
 			if(tup_db_select_node_dir_glob(build_name_list_cb, &args, srctent->tnode.tupid, pl->pel->path, pl->pel->len, &tf->g->gen_delete_root) < 0)
 				return -1;
 		}
+
+		if(!keep_glob)
+			return 0;
+
+		struct tup_entry *gtent = tup_db_create_node(pl->dt, pl->pel->path, TUP_NODE_GLOB);
+		if (!gtent) {
+			fprintf(tf->f, "tup error: Could not create glob file %s in %lld\n", pl->pel->path, pl->dt);
+			return -1;
+		}
+		if(build_name_list_cb(&args, gtent) < 0)
+			return -1;
 	}
 	return 0;
 }
@@ -2574,10 +2585,12 @@ static int do_rule(struct tupfile *tf, struct rule *r, struct name_list *nl,
 		struct name_list *use_onl;
 		pl = TAILQ_FIRST(&oplist);
 
+#if 0
 		if(pl->path) {
 			fprintf(tf->f, "tup error: Attempted to create an output file '%s', which contains a '/' character. Tupfiles should only output files in their own directories.\n - Directory: %lli\n - Rule at line %i: [35m%s[0m\n", pl->path, tf->tupid, r->line_number, r->command);
 			return -1;
 		}
+#endif
 		if(pl->pel->len == 1 && pl->pel->path[0] == '|') {
 			extra_outputs = 1;
 			goto out_pl;
@@ -2600,6 +2613,7 @@ static int do_rule(struct tupfile *tf, struct rule *r, struct name_list *nl,
 			free(onle);
 			return -1;
 		}
+#if 0
 		if(strchr(onle->path, '/')) {
 			/* Same error as above...uhh, I guess I should rework
 			 * this.
@@ -2609,6 +2623,13 @@ static int do_rule(struct tupfile *tf, struct rule *r, struct name_list *nl,
 			free(onle);
 			return -1;
 		}
+#endif
+		onle->len = strlen(onle->path);
+		onle->extlesslen = onle->len - 1;
+		while(onle->extlesslen > 0 && onle->path[onle->extlesslen] != '.')
+			onle->extlesslen--;
+
+		set_nle_base(onle);
 		if(name_cmp(onle->path, "Tupfile") == 0 ||
 		   name_cmp(onle->path, "Tuprules.tup") == 0 ||
 		   name_cmp(onle->path, TUP_CONFIG) == 0) {
@@ -2617,22 +2638,19 @@ static int do_rule(struct tupfile *tf, struct rule *r, struct name_list *nl,
 			free(onle);
 			return -1;
 		}
-		onle->len = strlen(onle->path);
-		onle->extlesslen = onle->len - 1;
-		while(onle->extlesslen > 0 && onle->path[onle->extlesslen] != '.')
-			onle->extlesslen--;
 
-		if(tf->srctent) {
+		if(tf->srctent && pl->dt == tf->tupid) {
+		//if(tf->srctent) {
 			struct tup_entry *tent;
 			if(tup_db_select_tent(tf->srctent->tnode.tupid, onle->path, &tent) < 0)
 				return -1;
 			if(tent && tent->type != TUP_NODE_GHOST) {
-				fprintf(tf->f, "tup error: Attempting to insert '%s' as a generated node when it already exists as a different type (%s) in the source directory. You can do one of two things to fix this:\n  1) If this file is really supposed to be created from the command, delete the file from the filesystem and try again.\n  2) Change your rule in the Tupfile so you aren't trying to overwrite the file.\n", onle->path, tup_db_type(tent->type));
+				fprintf(tf->f, "tup error: Attempting to insert '%s' (%s) as a generated node when it already exists as a different type (%s) in the source directory. You can do one of two things to fix this:\n1) If this file is really supposed to be created from the command, delete the file from the filesystem and try again.\n  2) Change your rule in the Tupfile so you aren't trying to overwrite the file.\n", onle->path, pl->path, tup_db_type(tent->type));
 				return -1;
 			}
 		}
 
-		onle->tent = tup_db_create_node_part(tf->tupid, onle->path, -1,
+		onle->tent = tup_db_create_node_part(pl->dt, onle->base, -1,
 						     TUP_NODE_GENERATED, -1, NULL);
 		if(!onle->tent) {
 			free(onle->path);
@@ -2640,7 +2658,13 @@ static int do_rule(struct tupfile *tf, struct rule *r, struct name_list *nl,
 			return -1;
 		}
 
-		set_nle_base(onle);
+		
+		if(tup_db_add_glob_links(onle->tent)) {
+			fprintf(tf->f, "tup error: couldn't create glob links for '%s'\n", onle->path);
+			return -1;
+		}
+		//fprintf(tf->f, "Created node at %s named %s\n", pl->path, onle->base);
+
 		if(extra_outputs) {
 			add_name_list_entry(&extra_onl, onle);
 		} else {

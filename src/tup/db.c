@@ -121,6 +121,7 @@ enum {
 	_DB_GET_DB_VAR_TREE,
 	_DB_VAR_FLAG_DIRS,
 	_DB_DELETE_VAR_ENTRY,
+	DB_LIST_GLOBS,
 	DB_NUM_STATEMENTS
 };
 
@@ -977,6 +978,9 @@ const char *tup_db_type(enum TUP_NODE_TYPE type)
 			break;
 		case TUP_NODE_GHOST:
 			str = "ghost";
+			break;
+		case TUP_NODE_GLOB:
+			str = "glob";
 			break;
 		case TUP_NODE_ROOT:
 			str = "graph root";
@@ -6196,4 +6200,57 @@ static int no_sync(void)
 		return -1;
 	}
 	return 0;
+}
+
+int tup_db_add_glob_links(struct tup_entry *tent)
+{
+	int dbrc, rc, curstyle;
+	sqlite3_stmt **stmt = &stmts[DB_LIST_GLOBS];
+	static char s[] = "select link.to_id from node inner join link on node.id = link.from_id where node.dir = ? and node.type = ? and ? glob node.name";
+	if(!*stmt) {
+		if(sqlite3_prepare_v2(tup_db, s, sizeof(s), stmt, NULL) != 0) {
+			fprintf(stderr, "SQL Error: %s\n", sqlite3_errmsg(tup_db));
+			fprintf(stderr, "Statement was: %s\n", s);
+		}
+	}
+
+	if(sqlite3_bind_int64(*stmt, 1, tent->dt) != 0) {
+		fprintf(stderr, "SQL bind error: %s\n", sqlite3_errmsg(tup_db));
+		fprintf(stderr, "Statement was: %s\n", s);
+		return -1;
+	}
+	if(sqlite3_bind_int(*stmt, 2, TUP_NODE_GLOB) != 0) {
+		fprintf(stderr, "SQL bind error: %s\n", sqlite3_errmsg(tup_db));
+		fprintf(stderr, "Statement was: %s\n", s);
+		return -1;
+	}
+	if(sqlite3_bind_text(*stmt, 3, tent->name.s, tent->name.len, SQLITE_STATIC) != 0) {
+		fprintf(stderr, "SQL bind error: %s\n", sqlite3_errmsg(tup_db));
+		fprintf(stderr, "Statement was: %s\n", s);
+		return -1;
+	}
+
+	rc = 0;
+	while((dbrc = sqlite3_step(*stmt)) == SQLITE_ROW) {
+		tupid_t destid = sqlite3_column_int64(*stmt, 0);
+		if((rc = tup_db_link_style(tent->tnode.tupid, destid, &curstyle)) < 0)
+			break;
+		if(curstyle == -1)
+			if((rc = link_insert(tent->tnode.tupid, destid, TUP_LINK_STICKY)) < 0)
+				break;
+		if((rc = link_update(tent->tnode.tupid, destid, TUP_LINK_STICKY | TUP_LINK_NORMAL)) < 0)
+			break;
+	}
+
+	if(dbrc != SQLITE_DONE && !rc) {
+		fprintf(stderr, "SQL step error: %s\n", sqlite3_errmsg(tup_db));
+		fprintf(stderr, "Statement was: %s\n", s);
+	}
+
+	if(msqlite3_reset(*stmt) != 0) {
+		fprintf(stderr, "SQL reset error: %s\n", sqlite3_errmsg(tup_db));
+		fprintf(stderr, "Statement was: %s\n", s);
+		return -1;
+	}
+	return rc;
 }

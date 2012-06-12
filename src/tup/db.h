@@ -172,4 +172,5 @@ int tup_db_check_actual_inputs(FILE *f, tupid_t cmdid,
 			       struct tupid_entries *normal_root);
 int tup_db_check_config_inputs(struct tup_entry *tent, struct tup_entry_head *readhead);
 
+int tup_db_add_glob_links(struct tup_entry *tent);
 #endif
