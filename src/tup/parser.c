@@ -158,6 +158,7 @@ struct tupfile {
 	struct timespan ts;
 	char ign;
 	char circular_dep_error;
+	struct bin_head *bl;
 };
 
 static int parse_tupfile(struct tupfile *tf, struct buf *b, const char *filename);
@@ -230,6 +231,7 @@ static char *tup_printf(struct tupfile *tf, const char *cmd, int cmd_len,
 			struct name_list *nl, struct name_list *onl,
 			const char *ext, int extlen, int is_command);
 static char *eval(struct tupfile *tf, const char *string, int allow_nodes);
+static char *get_arg_until(const char *string, const char endchar);
 
 static int debug_run = 0;
 
@@ -293,6 +295,7 @@ int parse(struct node *n, struct graph *g, struct timespan *retts)
 	}
 	tf.ign = 0;
 	tf.circular_dep_error = 0;
+	tf.bl = NULL;
 	if(nodedb_init(&tf.node_db) < 0)
 		goto out_server_stop;
 	if(vardb_init(&tf.vdb) < 0)
@@ -415,6 +418,8 @@ static int parse_tupfile(struct tupfile *tf, struct buf *b, const char *filename
 	char line_debug[128];
 
 	LIST_INIT(&bl);
+	if (!tf->bl)
+		tf->bl = &bl;
 	if_init(&ifs);
 
 	p = b->s;
@@ -517,19 +522,31 @@ static int parse_tupfile(struct tupfile *tf, struct buf *b, const char *filename
 		} else if(strcmp(line, "include_rules") == 0) {
 			rc = include_rules(tf);
 		} else if(strncmp(line, "run ", 4) == 0) {
-			rc = run_script(tf, line+4, lno, &bl);
+			rc = run_script(tf, line+4, lno, tf->bl);
 		} else if(strncmp(line, "export ", 7) == 0) {
 			rc = export(tf, line+7);
 		} else if(strcmp(line, ".gitignore") == 0) {
 			tf->ign = 1;
+		} else if(strcmp(line, "exit") == 0) {
+			bin_list_del(&bl);
+			return 1;
+		} else if(strncmp(line, "abort ", 6) == 0) {
+			bin_list_del(&bl);
+			fprintf(tf->f, "Abort while parsing %s line %i\n  Reason: '%s'\n", filename, lno, line + 6);
+			return -1;
 		} else if(line[0] == ':') {
-			rc = parse_rule(tf, line+1, lno, &bl);
+			rc = parse_rule(tf, line+1, lno, tf->bl);
 		} else if(line[0] == '!') {
 			rc = parse_bang_definition(tf, line, lno);
 		} else if(line[0] == '*') {
 			rc = parse_chain_definition(tf, line, lno);
 		} else {
 			rc = set_variable(tf, line);
+		}
+
+		if(rc == 1) {
+			bin_list_del(&bl);
+			return 1;
 		}
 
 		if(rc == SYNTAX_ERROR) {
@@ -555,6 +572,8 @@ static int eval_eq(struct tupfile *tf, char *expr, char *eol)
 {
 	char *paren;
 	char *comma;
+	char *rawlval;
+	char *rawrval;
 	char *lval;
 	char *rval;
 	int rc;
@@ -563,27 +582,25 @@ static int eval_eq(struct tupfile *tf, char *expr, char *eol)
 	if(!paren)
 		return SYNTAX_ERROR;
 	lval = paren + 1;
-	comma = strchr(lval, ',');
-	if(!comma)
+	rawlval = get_arg_until(lval, ',');
+	if(!rawlval)
 		return SYNTAX_ERROR;
+	comma = lval + strlen(rawlval);
 	rval = comma + 1;
+	rawrval = get_arg_until(rval, ')');
+	if(!rawrval)
+		return SYNTAX_ERROR;
 
-	paren = eol;
-	while(paren > expr) {
-		if(*paren == ')')
-            goto found_paren;
-		paren--;
-	}
-	return SYNTAX_ERROR;
-found_paren:
-	*comma = 0;
-	*paren = 0;
-
-	lval = eval(tf, lval, DISALLOW_NODES);
-	if(!lval)
+	lval = eval(tf, rawlval, DISALLOW_NODES);
+	if(!lval) {
+		free(rawlval);
+		free(rawrval);
 		return -1;
-	rval = eval(tf, rval, DISALLOW_NODES);
+	}
+	rval = eval(tf, rawrval, DISALLOW_NODES);
 	if(!rval) {
+		free(rawlval);
+		free(rawrval);
 		free(lval);
 		return -1;
 	}
@@ -592,6 +609,8 @@ found_paren:
 		rc = 1;
 	else
 		rc = 0;
+	free(rawlval);
+	free(rawrval);
 	free(lval);
 	free(rval);
 
@@ -651,7 +670,7 @@ static int include_rules(struct tupfile *tf)
 	p = path;
 	for(x=0; x<=num_dotdots; x++, p += 3) {
 		if(fstatat(tf->cur_dfd, p, &buf, AT_SYMLINK_NOFOLLOW) == 0)
-			if(include_file(tf, p) < 0)
+			if((rc = include_file(tf, p)))
 				goto out_free;
 	}
 	rc = 0;
@@ -940,9 +959,8 @@ static int include_file(struct tupfile *tf, const char *file)
 	if(fslurp_null(fd, &incb) < 0)
 		goto out_close;
 
-	if(parse_tupfile(tf, &incb, file) < 0)
+	if((rc = parse_tupfile(tf, &incb, file)) < 0)
 		goto out_free;
-	rc = 0;
 out_free:
 	free(incb.s);
 out_close:
@@ -968,7 +986,7 @@ out_err:
 		return -1;
 	}
 
-	return 0;
+	return rc;
 }
 
 static int parse_rule(struct tupfile *tf, char *p, int lno, struct bin_head *bl)
@@ -3050,6 +3068,156 @@ static char *tup_printf(struct tupfile *tf, const char *cmd, int cmd_len,
 	return s;
 }
 
+static char *get_arg_until(const char *string, const char endchar)
+{
+	int nestlevel = 0;
+	const char *end = string;
+	char c;
+	char *buf;
+	int buflen;
+	int endfound = endchar == 0;
+
+	while ((c = *end)) {
+		if (c == '(') {
+			nestlevel++;
+		} else if (c == ')') {
+			if (nestlevel) {
+				nestlevel--;
+			} else if (endchar == ')') {
+				endfound = 1;
+				break;
+			} else {
+				return NULL;
+			}
+		} else if (!nestlevel && c == endchar) {
+			endfound = 1;
+			break;
+		}
+
+		end++;
+	}
+
+	if (nestlevel || !endfound) {
+		return NULL;
+	}
+
+	buflen = end - string;
+	buf = malloc(buflen + 1);
+	if (!buf)
+		return NULL;
+
+	memcpy(buf, string, end - string);
+	buf[buflen] = 0;
+	return buf;
+}
+
+static int count_list_entries(const char *string)
+{
+	int count = 0;
+	int lastwhitespace = 1;
+	while (*string) {
+		if (*string == ' ' || *string == '\t')
+			lastwhitespace = 1;
+		else if (lastwhitespace) {
+			count++;
+			lastwhitespace = 0;
+		}
+
+		string++;
+	}
+	return count;
+}
+
+static int prefix_entries(const char *prefix, const char *list, char *out)
+{
+	int count = 0;
+	int lastwhitespace = 1;
+	int prefix_len = strlen(prefix);
+	while (*list) {
+		if (*list == ' ' || *list == '\t') {
+			lastwhitespace = 1;
+		} else if (lastwhitespace) {
+			lastwhitespace = 0;
+			strcpy(out, prefix);
+			out += prefix_len;
+			count += prefix_len;
+		}
+
+		count++;
+		*out++ = *list++;
+	}
+	return count;
+}
+
+static int suffix_entries(const char *suffix, const char *list, char *out)
+{
+	int count = 0;
+	int lastwhitespace = 0;
+	int suffix_len = strlen(suffix);
+	while (*list) {
+		if (*list != ' ' && *list != '\t') {
+			lastwhitespace = 0;
+		} else if (!lastwhitespace) {
+			lastwhitespace = 1;
+			strcpy(out, suffix);
+			out += suffix_len;
+			count += suffix_len;
+		}
+
+		count++;
+		*out++ = *list++;
+	}
+	return count;
+}
+
+static int filter_list(const char *filter, const char *list, int invert, char *out)
+{
+	int count = 0;
+	char *buf = NULL;
+	int prefixspace = 0;
+	while (*list) {
+		const char* next;
+		int entrylen;
+		if (*list == ' ' || *list == '\t') {
+			list++;
+			continue;
+		}
+
+		next = strpbrk(list, " \t");
+		if (!next)
+			entrylen = strlen(list);
+		else
+			entrylen = next - list;
+		buf = realloc(buf, entrylen + 1);
+		memcpy(buf, list, entrylen);
+		buf[entrylen] = 0;
+		list += entrylen;
+		if (!strstr(filter, buf) ^ invert)
+			continue;
+
+		count += entrylen + prefixspace;
+		if (out) {
+			if (prefixspace)
+				*out++ = ' ';
+			memcpy(out, buf, entrylen);
+			out += entrylen;
+		}
+		if (!prefixspace)
+			prefixspace = 1;
+	}
+	return count;
+}
+
+static int find_string_func(const char *needle, const char *list, char *out)
+{
+	char *match = strstr(list, needle);
+	if (!match)
+		return 0;
+	if (out)
+		memcpy(out, match, strlen(needle));
+	return strlen(needle);
+}
+
 static char *eval(struct tupfile *tf, const char *string, int allow_nodes)
 {
 	int len = 0;
@@ -3093,6 +3261,7 @@ static char *eval(struct tupfile *tf, const char *string, int allow_nodes)
 						return NULL;
 					}
 					len += clen;
+					s = rparen + 1;
 				} else if(rparen - var > 7 &&
 					  strncmp(var, "CONFIG_", 7) == 0) {
 					const char *atvar;
@@ -3101,13 +3270,91 @@ static char *eval(struct tupfile *tf, const char *string, int allow_nodes)
 					if(vlen < 0)
 						return NULL;
 					len += vlen;
+					s = rparen + 1;
+				} else if(rparen - var > 10 &&
+					  (strncmp(var, "addprefix ", 10) == 0 ||
+					   strncmp(var, "addsuffix ", 10) == 0)) {
+					const char *start = var + 10;
+					char *rawfix = get_arg_until(start, ',');
+					if (!rawfix) {
+						syntax_msg = "No prefix found";
+						goto syntax_error;
+					}
+					char *fix = eval(tf, rawfix, allow_nodes);
+
+					start += strlen(rawfix) + 1;
+					char *rawlist = get_arg_until(start, ')');
+					if (!rawlist) {
+						syntax_msg = "No list found";
+						goto syntax_error;
+					}
+
+					char *list = eval(tf, rawlist, allow_nodes);
+					int entries = count_list_entries(list);
+					s = var + 10 + strlen(rawfix) + 1 + strlen(rawlist) + 1;
+					len += strlen(list) + strlen(fix) * entries;
+					free(rawlist);
+					free(list);
+					free(rawfix);
+					free(fix);
+				} else if((rparen - var > 7 &&
+					   strncmp(var, "filter ", 7) == 0) ||
+					  (rparen - var > 11 &&
+					   strncmp(var, "filter-out ", 11) == 0)) {
+					int invert = strncmp(var, "filter-out ", 11) == 0;
+					int funclen = invert ? 11 : 7;
+					const char *start = var + funclen;
+					char *rawfilter = get_arg_until(start, ',');
+					if (!rawfilter) {
+						syntax_msg = "No filter list found";
+						goto syntax_error;
+					}
+
+					char *filter = eval(tf, rawfilter, allow_nodes);
+					start += strlen(rawfilter) + 1;
+					char *rawlist = get_arg_until(start, ')');
+					if (!rawlist) {
+						syntax_msg = "No list found";
+						goto syntax_error;
+					}
+					char *list = eval(tf, rawlist, allow_nodes);
+					s = var + funclen + strlen(rawfilter) + 1 + strlen(rawlist) + 1;
+					len += filter_list(filter, list, invert, NULL);
+					free(rawlist);
+					free(list);
+					free(rawfilter);
+					free(filter);
+				} else if(rparen - var > 11 &&
+					  strncmp(var, "findstring ", 11) == 0) {
+					const char *start = var + 11;
+					char *rawterm = get_arg_until(start, ',');
+					if (!rawterm) {
+						syntax_msg = "No search string found";
+						goto syntax_error;
+					}
+					char *term = eval(tf, rawterm, allow_nodes);
+
+					start += strlen(rawterm) + 1;
+					char *rawlist = get_arg_until(start, ')');
+					if (!rawlist) {
+						syntax_msg = "No list found";
+						goto syntax_error;
+					}
+
+					char *list = eval(tf, rawlist, allow_nodes);
+					s = var + 11 + strlen(rawterm) + 1 + strlen(rawlist) + 1;
+					len += find_string_func(term, list, NULL);
+					free(rawlist);
+					free(list);
+					free(rawterm);
+					free(term);
 				} else {
 					vlen = vardb_len(&tf->vdb, var, rparen-var);
 					if(vlen < 0)
 						return NULL;
 					len += vlen;
+					s = rparen + 1;
 				}
-				s = rparen + 1;
 			} else {
 				s++;
 				len++;
@@ -3205,6 +3452,7 @@ static char *eval(struct tupfile *tf, const char *string, int allow_nodes)
 						return NULL;
 					}
 					p += clen;
+					s = rparen + 1;
 				} else if(rparen - var > 7 &&
 					  strncmp(var, "CONFIG_", 7) == 0) {
 					const char *atvar;
@@ -3216,11 +3464,85 @@ static char *eval(struct tupfile *tf, const char *string, int allow_nodes)
 						return NULL;
 					if(tupid_tree_add_dup(&tf->input_root, tent->tnode.tupid) < 0)
 						return NULL;
+					s = rparen + 1;
+				} else if(rparen - var > 10 &&
+					  (strncmp(var, "addprefix ", 10) == 0 ||
+					   strncmp(var, "addsuffix ", 10) == 0)) {
+					const char *start = var + 10;
+					char *rawfix = get_arg_until(start, ',');
+					if (!rawfix) {
+						syntax_msg = "No suffix/prefix found";
+						goto syntax_error;
+					}
+					char *fix = eval(tf, rawfix, allow_nodes);
+					start += strlen(rawfix) + 1;
+					char *rawlist = get_arg_until(start, ')');
+					char *list = eval(tf, rawlist, allow_nodes);
+					s = var + 10 + strlen(rawfix) + 1 + strlen(rawlist) + 1;
+					if (!strncmp(var, "addprefix ", 10))
+						p += prefix_entries(fix, list, p);
+					else
+						p += suffix_entries(fix, list, p);
+					free(rawlist);
+					free(list);
+					free(rawfix);
+					free(fix);
+				} else if((rparen - var > 7 &&
+					   strncmp(var, "filter ", 7) == 0) ||
+					  (rparen - var > 11 &&
+					   strncmp(var, "filter-out ", 11) == 0)) {
+					int invert = strncmp(var, "filter-out ", 11) == 0;
+					int funclen = invert ? 11 : 7;
+					const char *start = var + funclen;
+					char *rawfilter = get_arg_until(start, ',');
+					if (!rawfilter) {
+						syntax_msg = "No filter list found";
+						goto syntax_error;
+					}
+
+					char *filter = eval(tf, rawfilter, allow_nodes);
+					start += strlen(rawfilter) + 1;
+					char *rawlist = get_arg_until(start, ')');
+					if (!rawlist) {
+						syntax_msg = "No list found";
+						goto syntax_error;
+					}
+					char *list = eval(tf, rawlist, allow_nodes);
+					s = var + funclen + strlen(rawfilter) + 1 + strlen(rawlist) + 1;
+					p += filter_list(filter, list, invert, p);
+					free(rawlist);
+					free(list);
+					free(rawfilter);
+					free(filter);
+				} else if(rparen - var > 11 &&
+					  strncmp(var, "findstring ", 11) == 0) {
+					const char *start = var + 11;
+					char *rawterm = get_arg_until(start, ',');
+					if (!rawterm) {
+						syntax_msg = "No search string found";
+						goto syntax_error;
+					}
+					char *term = eval(tf, rawterm, allow_nodes);
+
+					start += strlen(rawterm) + 1;
+					char *rawlist = get_arg_until(start, ')');
+					if (!rawlist) {
+						syntax_msg = "No list found";
+						goto syntax_error;
+					}
+
+					char *list = eval(tf, rawlist, allow_nodes);
+					s = var + 11 + strlen(rawterm) + 1 + strlen(rawlist) + 1;
+					p += find_string_func(term, list, p);
+					free(rawlist);
+					free(list);
+					free(rawterm);
+					free(term);
 				} else {
 					if(vardb_copy(&tf->vdb, var, rparen-var, &p) < 0)
 						return NULL;
+					s = rparen + 1;
 				}
-				s = rparen + 1;
 			} else {
 				*p = *s;
 				p++;

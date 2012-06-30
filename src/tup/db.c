@@ -3151,6 +3151,7 @@ int tup_db_create_unique_link(tupid_t a, tupid_t b, struct tupid_entries *delroo
 	fprintf(stderr, "tup error: Unable to create a unique link from %lli to %lli because the destination is already linked to by node %lli.\n", a, b, incoming);
 	tup_db_print(stderr, a);
 	tup_db_print(stderr, b);
+	tup_db_print(stderr, incoming);
 	return -1;
 }
 
