@@ -58,6 +58,29 @@ tupid_t create_command_file(tupid_t dt, const char *cmd)
 	return -1;
 }
 
+static int add_glob_deps_cb(void *arg, struct tup_entry *tent)
+{
+	struct tup_entry *gtent = arg;
+	return tup_db_create_link(tent->tnode.tupid, gtent->tnode.tupid, TUP_LINK_STICKY);
+}
+
+struct tup_entry *create_glob_file(tupid_t dt, const char *glob, struct tupid_entries *delete_root)
+{
+	struct tup_entry *tent = NULL;
+
+	if (tup_db_select_tent(dt, glob, &tent) >= 0 && tent)
+		return tent;
+
+	tent = tup_db_create_node(dt, glob, TUP_NODE_GLOB);
+	if (!tent)
+		return NULL;
+
+	if (tup_db_select_node_dir_glob(add_glob_deps_cb, tent, dt, glob, -1, delete_root) < 0)
+		return NULL;
+
+	return tent;
+}
+
 tupid_t tup_file_mod(tupid_t dt, const char *file, int *modified)
 {
 	int fd;

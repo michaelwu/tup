@@ -213,6 +213,7 @@ static int nl_add_path(struct tupfile *tf, struct path_list *pl,
 		       struct name_list *nl, int required, int keep_glob);
 static int nl_add_bin(struct bin *b, struct name_list *nl);
 static int build_name_list_cb(void *arg, struct tup_entry *tent);
+static int build_glob_deps_cb(void *arg, struct tup_entry *tent);
 static char *set_path(const char *name, const char *dir, int dirlen);
 static int do_rule(struct tupfile *tf, struct rule *r, struct name_list *nl,
 		   const char *ext, int extlen,
@@ -2384,7 +2385,7 @@ static int nl_add_path(struct tupfile *tf, struct path_list *pl,
 		}
 		if(build_name_list_cb(&args, tent) < 0)
 			return -1;
-	} else {
+	} else if (!keep_glob) {
 		struct tup_entry *srctent = NULL;
 		struct tup_entry *dtent;
 
@@ -2403,11 +2404,18 @@ static int nl_add_path(struct tupfile *tf, struct path_list *pl,
 			if(tup_db_select_node_dir_glob(build_name_list_cb, &args, srctent->tnode.tupid, pl->pel->path, pl->pel->len, &tf->g->gen_delete_root) < 0)
 				return -1;
 		}
+	} else {
+		struct tup_entry *srctent = NULL;
+		struct tup_entry *dtent;
 
-		if(!keep_glob)
-			return 0;
+		if(tup_entry_add(pl->dt, &dtent) < 0)
+			return -1;
+		if(dtent->type == TUP_NODE_GHOST) {
+			fprintf(tf->f, "tup error: Unable to generate wildcard for directory '%s' since it is a ghost.\n", pl->path);
+			return -1;
+		}
 
-		struct tup_entry *gtent = tup_db_create_node(pl->dt, pl->pel->path, TUP_NODE_GLOB);
+		struct tup_entry *gtent = create_glob_file(pl->dt, pl->pel->path, &tf->g->gen_delete_root);
 		if (!gtent) {
 			fprintf(tf->f, "tup error: Could not create glob file %s in %lld\n", pl->pel->path, pl->dt);
 			return -1;

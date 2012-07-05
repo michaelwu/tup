@@ -24,6 +24,7 @@
 #include "tupid.h"
 #include <time.h>
 
+struct tupid_entries;
 struct tup_entry;
 struct tup_entry_head;
 struct path_element;
@@ -32,6 +33,7 @@ struct pel_group;
 int create_name_file(tupid_t dt, const char *file, time_t mtime,
 		     struct tup_entry **entry);
 tupid_t create_command_file(tupid_t dt, const char *cmd);
+struct tup_entry *create_glob_file(tupid_t dt, const char *glob, struct tupid_entries *delete_root);
 tupid_t tup_file_mod(tupid_t dt, const char *file, int *modified);
 tupid_t tup_file_mod_mtime(tupid_t dt, const char *file, time_t mtime,
 			   int force, int ignore_generated, int *modified);

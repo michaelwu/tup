@@ -5142,7 +5142,8 @@ static int del_normal_link(tupid_t tupid, void *data)
 }
 
 static int check_generated_inputs(FILE *f, struct tupid_entries *missing_input_root,
-				  struct tupid_entries *valid_input_root)
+				  struct tupid_entries *valid_input_root,
+				  struct tupid_entries *valid_input_globs)
 {
 	int found_error = 0;
 	struct tupid_tree *tt;
@@ -5167,6 +5168,19 @@ static int check_generated_inputs(FILE *f, struct tupid_entries *missing_input_r
 		}
 	}
 
+	/* Check for glob matches */
+	RB_FOREACH_SAFE(tt, tupid_entries, missing_input_root, tmp) {
+		struct tupid_tree *tt2;
+
+		RB_FOREACH(tt2, tupid_entries, valid_input_globs) {
+			if(!tup_db_link_exists(tt->tupid, tt2->tupid)) {
+				tupid_tree_rm(missing_input_root, tt);
+				free(tt);
+				break;
+			}
+		}
+	}
+
 	/* Anything we couldn't connect is an error. */
 	RB_FOREACH(tt, tupid_entries, missing_input_root) {
 		if(!found_error) {
@@ -5186,6 +5200,7 @@ int tup_db_check_actual_inputs(FILE *f, tupid_t cmdid,
 			       struct tupid_entries *normal_root)
 {
 	struct tupid_entries sticky_copy = {NULL};
+	struct tupid_entries glob_list = {NULL};
 	struct actual_input_data aid = {
 		.f = f,
 		.cmdid = cmdid,
@@ -5195,6 +5210,7 @@ int tup_db_check_actual_inputs(FILE *f, tupid_t cmdid,
 	};
 	int rc;
 	struct tup_entry *cmd_tent;
+	struct tupid_tree *tt;
 
 	if(tup_entry_add(cmdid, &cmd_tent) < 0)
 		return -1;
@@ -5202,8 +5218,18 @@ int tup_db_check_actual_inputs(FILE *f, tupid_t cmdid,
 
 	if(get_output_tree(cmdid, &aid.output_root) < 0)
 		return -1;
-	if(tupid_tree_copy(&sticky_copy, aid.sticky_root) < 0)
-		return -1;
+	RB_FOREACH(tt, tupid_entries, aid.sticky_root) {
+		struct tup_entry *tent = NULL;
+		if (tup_entry_add(tt->tupid, &tent) < 0)
+			return -1;
+
+		if (tent->type != TUP_NODE_GLOB)
+			rc = tupid_tree_add(&sticky_copy, tt->tupid);
+		else
+			rc = tupid_tree_add(&glob_list, tt->tupid);
+		if (rc < 0)
+			return -1;
+	}
 	/* First check if we are missing any links that should be sticky. We
 	 * don't care about any links that are marked sticky but aren't used.
 	 */
@@ -5211,12 +5237,13 @@ int tup_db_check_actual_inputs(FILE *f, tupid_t cmdid,
 			     new_input, NULL) < 0)
 		return -1;
 
-	rc = check_generated_inputs(f, &aid.missing_input_root, aid.sticky_root);
+	rc = check_generated_inputs(f, &aid.missing_input_root, aid.sticky_root, &glob_list);
 
 	if(compare_list_tree(readhead, normal_root, &aid,
 			     new_normal_link, del_normal_link) < 0)
 		return -1;
 	free_tupid_tree(&sticky_copy);
+	free_tupid_tree(&glob_list);
 	free_tupid_tree(&aid.output_root);
 	free_tupid_tree(&aid.missing_input_root);
 	return rc;
@@ -6207,7 +6234,7 @@ int tup_db_add_glob_links(struct tup_entry *tent)
 {
 	int dbrc, rc, curstyle;
 	sqlite3_stmt **stmt = &stmts[DB_LIST_GLOBS];
-	static char s[] = "select link.to_id from node inner join link on node.id = link.from_id where node.dir = ? and node.type = ? and ? glob node.name";
+	static char s[] = "select id from node where node.dir = ? and node.type = ? and ? glob name";
 	if(!*stmt) {
 		if(sqlite3_prepare_v2(tup_db, s, sizeof(s), stmt, NULL) != 0) {
 			fprintf(stderr, "SQL Error: %s\n", sqlite3_errmsg(tup_db));
